@@ -1,38 +1,75 @@
 import os
 import json
-import threading
 import time
-import schedule
+import logging
 from datetime import datetime
-from flask import Flask, request
-from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 import gspread
 from google.oauth2.service_account import Credentials
-import logging
+from gspread.exceptions import SpreadsheetNotFound, WorksheetNotFound, APIError
 
-# Configurar logging para ver os erros no Render
+# Configurar logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-app = Flask(__name__)
+logger = logging.getLogger(__name__)
 
 # ==============================
 # CONFIGURAÇÕES
 # ==============================
 NOME_PLANILHA = "Controle_Despesas"
-TWILIO_WHATSAPP_FROM = 'whatsapp:+14155238886' # Seu número Twilio WhatsApp
+TWILIO_WHATSAPP_FROM = os.environ.get('TWILIO_WHATSAPP_FROM', 'whatsapp:+14155238886') # Seu número Twilio WhatsApp
 
 # ==============================
-# INICIALIZAÇÃO DO CLIENTE GSPREAD (UMA VEZ APENAS)
+# FUNÇÕES AUXILIARES (copiadas de app.py para auto-suficiência)
+# ==============================
+def parse_float_value(value_str):
+    """Converte string para float, aceitando ',' ou '.' como decimal."""
+    if not isinstance(value_str, str):
+        raise ValueError("O valor não é uma string.")
+
+    cleaned_value = value_str.replace('R$', '').replace('r$', '').strip().replace('.', '').replace(',', '.')
+
+    if not re.match(r"^-?\d+(\.\d+)?$", cleaned_value):
+        raise ValueError(f"Formato de valor inválido: '{value_str}'")
+
+    return float(cleaned_value)
+
+def retry_gspread_operation(func, *args, **kwargs):
+    """Tenta executar uma operação gspread com retry exponencial."""
+    max_retries = 3
+    base_delay = 1 # segundos
+
+    for i in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except APIError as e:
+            if e.response.status_code in [403, 429, 500, 502, 503, 504]:
+                delay = base_delay * (2 ** i)
+                logger.warning(f"Erro gspread API (status {e.response.status_code}), tentando novamente em {delay}s. Tentativa {i+1}/{max_retries}", exc_info=True)
+                time.sleep(delay)
+            else:
+                raise
+        except Exception as e:
+            logger.error(f"Erro inesperado durante operação gspread. Tentativa {i+1}/{max_retries}", exc_info=True)
+            raise
+    raise Exception(f"Falha após {max_retries} tentativas na operação gspread.")
+
+# ==============================
+# INICIALIZAÇÃO DO CLIENTE GSPREAD
 # ==============================
 def obter_gspread_client():
+    """Inicializa e retorna o cliente gspread."""
     try:
         creds_json = os.environ.get('GOOGLE_CREDENTIALS_JSON')
         if not creds_json:
-            logging.error("Variável de ambiente GOOGLE_CREDENTIALS_JSON não encontrada.")
+            logger.critical("Variável de ambiente GOOGLE_CREDENTIALS_JSON não encontrada.")
             return None
 
         info = json.loads(creds_json)
+
+        if not all(k in info for k in ["type", "project_id", "private_key_id", "private_key", "client_email", "client_id", "auth_uri", "token_uri", "auth_provider_x509_cert_url", "client_x509_cert_url"]):
+            logger.critical("JSON de credenciais do Google incompleto ou inválido.")
+            return None
+
         creds = Credentials.from_service_account_info(
             info,
             scopes=[
@@ -40,66 +77,28 @@ def obter_gspread_client():
                 "https://www.googleapis.com/auth/drive"
             ]
         )
-        logging.info("Credenciais do Google Sheets carregadas com sucesso.")
+        logger.info("Credenciais do Google Sheets carregadas com sucesso para o relatório.")
         return gspread.authorize(creds)
+    except json.JSONDecodeError:
+        logger.critical("Erro ao decodificar GOOGLE_CREDENTIALS_JSON para o relatório. Verifique o formato.", exc_info=True)
+        return None
     except Exception as e:
-        logging.error(f"Erro ao inicializar o cliente gspread: {e}", exc_info=True)
+        logger.critical(f"Erro ao inicializar o cliente gspread para o relatório: {e}", exc_info=True)
         return None
 
-GSHEET_CLIENT = obter_gspread_client()
+GSHEET_CLIENT_REPORT = obter_gspread_client()
 
-if GSHEET_CLIENT is None:
-    logging.critical("Cliente gspread não inicializado. Funções de planilha não funcionarão.")
-
-# ==============================
-# SALVAR NA PLANILHA
-# ==============================
-def salvar_na_planilha(corpo):
-    if GSHEET_CLIENT is None:
-        logging.error("Não foi possível salvar: Cliente gspread não está disponível.")
-        return
-
-    try:
-        partes = [p.strip() for p in corpo.split(';')]
-        desc, valor_str, cat = partes
-        valor = float(valor_str.replace(',', '.'))
-
-        sh = GSHEET_CLIENT.open(NOME_PLANILHA)
-
-        d = desc.upper()
-        nome_aba = "Geral"
-
-        if "BLUE" in d:
-            nome_aba = "Blue House"
-        elif "UP" in d:
-            nome_aba = "UP BAR"
-        elif "HOUSE" in d: # Verifique o nome EXATO da aba no Google Sheets
-            nome_aba = "House" # Ou "HOUSE" se for tudo maiúsculo na planilha
-
-        aba = sh.worksheet(nome_aba)
-
-        data = datetime.now().strftime('%d/%m/%Y')
-
-        aba.append_row([data, desc, valor, cat])
-
-        logging.info(f"Salvo com sucesso na aba '{nome_aba}': {desc}, R$ {valor:.2f}, {cat}")
-
-    except gspread.exceptions.SpreadsheetNotFound:
-        logging.error(f"Planilha '{NOME_PLANILHA}' não encontrada. Verifique o nome ou permissões.", exc_info=True)
-    except gspread.exceptions.WorksheetNotFound:
-        logging.error(f"Aba '{nome_aba}' não encontrada na planilha '{NOME_PLANILHA}'. Verifique o nome da aba.", exc_info=True)
-    except ValueError:
-        logging.error(f"Erro de conversão de valor ao salvar: '{valor_str}' não é um número válido.", exc_info=True)
-    except Exception as e:
-        logging.error(f"Erro inesperado ao salvar na planilha: {e}", exc_info=True)
+if GSHEET_CLIENT_REPORT is None:
+    logger.critical("Cliente gspread para relatório não inicializado. O relatório não será enviado.")
 
 # ==============================
 # RELATÓRIO DIÁRIO
 # ==============================
 def enviar_relatorio_diario():
-    logging.info("Iniciando envio de relatório diário.")
-    if GSHEET_CLIENT is None:
-        logging.error("Não foi possível enviar relatório: Cliente gspread não está disponível.")
+    """Gera e envia o relatório diário de despesas via WhatsApp."""
+    logger.info("Iniciando envio de relatório diário.")
+    if GSHEET_CLIENT_REPORT is None:
+        logger.error("Não foi possível enviar relatório: Cliente gspread não está disponível.")
         return
 
     try:
@@ -108,44 +107,52 @@ def enviar_relatorio_diario():
         seu_whatsapp = os.environ.get("SEU_WHATSAPP")
 
         if not all([twilio_account_sid, twilio_auth_token, seu_whatsapp]):
-            logging.error("Variáveis de ambiente TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN ou SEU_WHATSAPP não configuradas para o relatório.")
+            logger.error("Variáveis de ambiente TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN ou SEU_WHATSAPP não configuradas para o relatório.")
             return
 
         client_twilio = Client(twilio_account_sid, twilio_auth_token)
 
-        sh = GSHEET_CLIENT.open(NOME_PLANILHA)
-        aba = sh.worksheet("Geral") # Assumindo que a aba "Geral" existe e tem todos os dados
-        dados = aba.get_all_values()
+        sh = retry_gspread_operation(GSHEET_CLIENT_REPORT.open, NOME_PLANILHA)
+        aba = retry_gspread_operation(sh.worksheet, "Geral") # Assumindo que a aba "Geral" existe e tem todos os dados
+        dados = retry_gspread_operation(aba.get_all_values)
 
         hoje = datetime.now().strftime('%d/%m/%Y')
 
         total = 0
         categorias = {}
+        lancamentos_hoje = 0
 
         # Pula o cabeçalho
         for linha in dados[1:]:
             try:
-                data, desc, valor_str, cat = linha
+                # Garante que a linha tem colunas suficientes
+                if len(linha) < 4:
+                    logger.warning(f"Linha com formato inesperado (menos de 4 colunas) no relatório: {linha}")
+                    continue
+
+                data, desc, valor_str, cat = linha[0], linha[1], linha[2], linha[3]
+
                 if data == hoje:
-                    valor = float(valor_str.replace(',', '.')) # Garante que o valor é float
+                    valor = parse_float_value(valor_str)
                     total += valor
                     categorias[cat] = categorias.get(cat, 0) + valor
-            except ValueError:
-                logging.warning(f"Valor não numérico encontrado na linha do relatório: {linha}", exc_info=True)
-            except IndexError:
-                logging.warning(f"Linha com formato inesperado no relatório: {linha}", exc_info=True)
+                    lancamentos_hoje += 1
+            except ValueError as ve:
+                logger.warning(f"Erro de valor ao processar linha do relatório: {linha} - {ve}", exc_info=True)
             except Exception as e:
-                logging.error(f"Erro ao processar linha do relatório: {linha} - {e}", exc_info=True)
+                logger.error(f"Erro inesperado ao processar linha do relatório: {linha} - {e}", exc_info=True)
                 continue
 
         msg = f"📊 Relatório do dia {hoje}\n\n"
 
-        if not categorias:
+        if lancamentos_hoje == 0:
             msg += "Nenhum lançamento registrado hoje."
         else:
-            for cat, v in categorias.items():
-                msg += f"{cat}: R$ {v:.2f}\n"
-            msg += f"\n💰 Total: R$ {total:.2f}"
+            # Ordena categorias por valor decrescente
+            sorted_categorias = sorted(categorias.items(), key=lambda item: item[1], reverse=True)
+            for cat, v in sorted_categorias:
+                msg += f"• {cat}: R$ {v:.2f}\n"
+            msg += f"\n💰 Total: R$ {total:.2f} ({lancamentos_hoje} lançamentos)"
 
         client_twilio.messages.create(
             body=msg,
@@ -153,62 +160,19 @@ def enviar_relatorio_diario():
             to=seu_whatsapp
         )
 
-        logging.info("Relatório diário enviado com sucesso!")
+        logger.info("Relatório diário enviado com sucesso!")
 
-    except gspread.exceptions.SpreadsheetNotFound:
-        logging.error(f"Planilha '{NOME_PLANILHA}' não encontrada para o relatório.", exc_info=True)
-    except gspread.exceptions.WorksheetNotFound:
-        logging.error(f"Aba 'Geral' não encontrada na planilha '{NOME_PLANILHA}' para o relatório.", exc_info=True)
+    except SpreadsheetNotFound:
+        logger.error(f"Planilha '{NOME_PLANILHA}' não encontrada para o relatório.", exc_info=True)
+    except WorksheetNotFound:
+        logger.error(f"Aba 'Geral' não encontrada na planilha '{NOME_PLANILHA}' para o relatório.", exc_info=True)
     except Exception as e:
-        logging.error(f"Erro inesperado no envio do relatório diário: {e}", exc_info=True)
+        logger.error(f"Erro inesperado no envio do relatório diário: {e}", exc_info=True)
 
 # ==============================
-# AGENDADOR
-# ==============================
-def rodar_agendador():
-    # ATENÇÃO: Esta função só é adequada se você tiver um worker separado no Render
-    # ou se estiver rodando localmente.
-    # No Web Service do Render, pode não ser confiável.
-    logging.info("Agendador iniciado. Relatório diário agendado para 23:59.")
-    schedule.every().day.at("23:59").do(enviar_relatorio_diario)
-
-    while True:
-        schedule.run_pending()
-        time.sleep(1) # Reduzido para 1 segundo para maior responsividade do agendador
-
-# ==============================
-# WEBHOOK WHATSAPP
-# ==============================
-@app.route("/webhook", methods=['POST'])
-def webhook():
-    corpo = request.values.get('Body', '').strip()
-    logging.info(f"Webhook recebido: '{corpo}'")
-
-    resp = MessagingResponse()
-
-    if ";" not in corpo or len(corpo.split(';')) != 3:
-        resp.body("⚠️ Use: Descrição; Valor; Categoria")
-        logging.warning(f"Formato inválido da mensagem: '{corpo}'")
-        return str(resp), 200, {'Content-Type': 'application/xml'}
-
-    # Salva em segundo plano para não bloquear a resposta do Twilio
-    try:
-        threading.Thread(target=salvar_na_planilha, args=(corpo,)).start()
-        logging.info(f"Tarefa de salvar na planilha iniciada em segundo plano para: '{corpo}'")
-        resp.body("🚀 Recebido! Lançando na planilha...")
-    except Exception as e:
-        logging.error(f"Erro ao iniciar thread para salvar na planilha: {e}", exc_info=True)
-        resp.body("❌ Erro interno ao processar sua solicitação. Tente novamente.")
-
-    return str(resp), 200, {'Content-Type': 'application/xml'}
-
-# ==============================
-# MAIN
+# MAIN para o Cron Job
 # ==============================
 if __name__ == "__main__":
-    # ATENÇÃO: No Render, se você usar um Web Service, rodar o agendador em uma thread
-    # pode não ser a melhor prática. O ideal é usar um Cron Job separado para o relatório.
-    # Para testes locais, funciona.
-    logging.info("Iniciando aplicação Flask.")
-    threading.Thread(target=rodar_agendador, daemon=True).start() # daemon=True para a thread morrer com o app
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    logger.info("Iniciando script de relatório diário.")
+    enviar_relatorio_diario()
+    logger.info("Script de relatório diário finalizado.")
